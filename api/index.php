@@ -7,11 +7,11 @@ function encryptAES($text, $password) {
     // Generate key using PBKDF2
     $key = hash_pbkdf2('sha256', $password, $salt, $iterations, 32, true);
     
-    // Generate random IV
-    $iv = random_bytes(12);
+    // Generate proper 16-byte IV for AES-256-CBC
+    $iv = random_bytes(16);
     
-    // Encrypt using AES-256-CBC as a fallback since AES-GCM might not be available in all PHP installations
-    $encrypted = openssl_encrypt($text, 'aes-256-cbc', $key, OPENSSL_RAW_DATA, substr($iv, 0, 16));
+    // Encrypt using AES-256-CBC
+    $encrypted = openssl_encrypt($text, 'aes-256-cbc', $key, OPENSSL_RAW_DATA, $iv);
     
     if ($encrypted === false) {
         throw new Exception('Encryption failed: ' . openssl_error_string());
