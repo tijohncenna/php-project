@@ -7,12 +7,12 @@ function decryptAES($encryptedBuffer, $password) {
     // Generate key using PBKDF2
     $key = hash_pbkdf2('sha256', $password, $salt, $iterations, 32, true);
     
-    // Extract IV and encrypted content
-    $iv = substr($encryptedBuffer, 0, 12);
-    $encryptedContent = substr($encryptedBuffer, 12);
+    // Extract IV and encrypted content - now using 16 bytes for IV
+    $iv = substr($encryptedBuffer, 0, 16);
+    $encryptedContent = substr($encryptedBuffer, 16);
     
     // Decrypt using AES-CBC
-    $decrypted = openssl_decrypt($encryptedContent, 'aes-256-cbc', $key, OPENSSL_RAW_DATA, substr($iv, 0, 16));
+    $decrypted = openssl_decrypt($encryptedContent, 'aes-256-cbc', $key, OPENSSL_RAW_DATA, $iv);
     
     if ($decrypted === false) {
         throw new Exception('Decryption failed: ' . openssl_error_string());
@@ -116,8 +116,12 @@ function streamFileWithoutZipHeaderWithCurl($sourceUrl, $start = 0, $end = null,
 // Default password for encryption
 $defaultPassword = '1234';
 
+// Ensure no output has been sent before
+ob_start();
+
 // Check if token is provided
 if (!isset($_GET['token']) || empty($_GET['token'])) {
+    ob_end_clean();
     http_response_code(400);
     echo 'Missing token parameter';
     exit;
@@ -132,6 +136,7 @@ try {
     
     $data = json_decode($decryptedData, true);
     if (!$data || !isset($data['url']) || !isset($data['title'])) {
+        ob_end_clean();
         http_response_code(400);
         echo 'Invalid download token';
         exit;
@@ -143,6 +148,7 @@ try {
     // Verify the file extension
     $extension = getExtension($title);
     if (!$extension || !isset($VIDEO_FORMATS[$extension])) {
+        ob_end_clean();
         http_response_code(400);
         echo 'Invalid or unsupported video format';
         exit;
@@ -162,6 +168,7 @@ try {
     curl_close($ch);
     
     if ($originalContentLength <= 0) {
+        ob_end_clean();
         http_response_code(500);
         echo 'Could not determine file size';
         exit;
@@ -170,6 +177,9 @@ try {
     // Adjusted content length (removing 4 bytes ZIP header)
     $originalContentLength = (int)$originalContentLength;
     $contentLength = $originalContentLength - 4;
+    
+    // Clear any existing output before sending headers
+    ob_end_clean();
     
     // Process Range header if present
     $rangeHeader = isset($_SERVER['HTTP_RANGE']) ? $_SERVER['HTTP_RANGE'] : null;
@@ -203,6 +213,7 @@ try {
         streamFileWithoutZipHeaderWithCurl($sourceUrl);
     }
 } catch (Exception $e) {
+    ob_end_clean();
     http_response_code(500);
     echo 'Error processing download: ' . $e->getMessage();
 }
