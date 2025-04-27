@@ -7,7 +7,7 @@ function decryptAES($encryptedBuffer, $password) {
     // Generate key using PBKDF2
     $key = hash_pbkdf2('sha256', $password, $salt, $iterations, 32, true);
     
-    // Extract IV and encrypted content - now using 16 bytes for IV
+    // Extract IV and encrypted content - using 16 bytes for IV
     $iv = substr($encryptedBuffer, 0, 16);
     $encryptedContent = substr($encryptedBuffer, 16);
     
@@ -65,57 +65,26 @@ function getExtension($filename) {
 }
 
 // Function to parse HTTP range header
-function parseRange($rangeHeader, $fileSize) {
+function parseRange($rangeHeader) {
     if (!$rangeHeader || !preg_match('/bytes=(\d*)-(\d*)/', $rangeHeader, $matches)) {
         return null;
     }
     
     $start = !empty($matches[1]) ? intval($matches[1]) : 0;
-    $end = !empty($matches[2]) ? intval($matches[2]) : $fileSize - 1;
-    
-    $end = min($end, $fileSize - 1);
-    
-    if ($start > $end || $start >= $fileSize) {
-        return null;
-    }
+    $end = !empty($matches[2]) ? intval($matches[2]) : null;
     
     return ['start' => $start, 'end' => $end];
 }
 
-// Function to get file size using file_get_contents instead of curl
-function getFileSize($url) {
-    $context = stream_context_create([
-        'http' => [
-            'method' => 'HEAD',
-            'follow_location' => 1,
-            'ignore_errors' => true
-        ],
-        'ssl' => [
-            'verify_peer' => false,
-            'verify_peer_name' => false
-        ]
-    ]);
+// Function to stream a file directly - quick start, no size checking
+function streamFileQuick($sourceUrl, $start = 0, $skipBytes = 4) {
+    // Set timeout to avoid Vercel's 10-second limit
+    set_time_limit(0);
+    ini_set('max_execution_time', 0);
     
-    $headers = @get_headers($url, 1, $context);
-    if (!$headers || strpos($headers[0], '200') === false) {
-        return -1;
-    }
-    
-    if (isset($headers['Content-Length'])) {
-        return (int)$headers['Content-Length'];
-    } elseif (isset($headers['content-length'])) {
-        return (int)$headers['content-length'];
-    }
-    
-    return -1;
-}
-
-// Function to stream a file in chunks using file_get_contents instead of curl
-function streamFileWithoutZipHeader($sourceUrl, $start = 0, $end = null, $skipBytes = 4) {
-    // Calculate the range
+    // Calculate the range start with ZIP header skip
     $rangeStart = $start + $skipBytes;
-    $rangeEnd = ($end !== null) ? ($end + $skipBytes) : '';
-    $range = "bytes=$rangeStart-$rangeEnd";
+    $range = "bytes=$rangeStart-";
     
     // Set up context options
     $context = stream_context_create([
@@ -123,7 +92,8 @@ function streamFileWithoutZipHeader($sourceUrl, $start = 0, $end = null, $skipBy
             'method' => 'GET',
             'header' => "Range: $range\r\n",
             'follow_location' => 1,
-            'ignore_errors' => true
+            'ignore_errors' => true,
+            'timeout' => 2  // Short timeout to start quickly
         ],
         'ssl' => [
             'verify_peer' => false,
@@ -131,18 +101,39 @@ function streamFileWithoutZipHeader($sourceUrl, $start = 0, $end = null, $skipBy
         ]
     ]);
     
-    // Stream the content in chunks to avoid memory issues
+    // Start streaming immediately in small chunks
     $handle = @fopen($sourceUrl, 'rb', false, $context);
     if (!$handle) {
         throw new Exception("Could not open stream for URL: $sourceUrl");
     }
     
-    while (!feof($handle)) {
-        echo fread($handle, 8192); // Read and output 8KB at a time
+    // Set to non-blocking if possible
+    if (function_exists('stream_set_blocking')) {
+        stream_set_blocking($handle, 0);
+    }
+    
+    // Read and output in small chunks to get data flowing quickly
+    $chunkSize = 8192; // 8KB chunks
+    $bytesRead = 0;
+    $startTime = microtime(true);
+    
+    while (!feof($handle) && (microtime(true) - $startTime) < 9.5) { // Keep under Vercel's 10s limit
+        $data = fread($handle, $chunkSize);
+        if ($data === false) {
+            break;
+        }
+        echo $data;
         flush();
+        $bytesRead += strlen($data);
+        
+        // Brief pause to allow output buffer to flush
+        if (function_exists('usleep')) {
+            usleep(1000); // 1ms pause
+        }
     }
     
     fclose($handle);
+    return $bytesRead;
 }
 
 // Default password for encryption
@@ -162,7 +153,10 @@ if (!isset($_GET['token']) || empty($_GET['token'])) {
 $token = $_GET['token'];
 
 try {
-    // Decode and decrypt the token
+    // Start timing for performance tracking
+    $startTime = microtime(true);
+    
+    // Decode and decrypt the token (this is quick)
     $encryptedBuffer = customBase64Decode($token);
     $decryptedData = decryptAES($encryptedBuffer, $defaultPassword);
     
@@ -177,7 +171,7 @@ try {
     $sourceUrl = $data['url'];
     $title = $data['title'];
     
-    // Verify the file extension
+    // Verify the file extension (this is quick)
     $extension = getExtension($title);
     if (!$extension || !isset($VIDEO_FORMATS[$extension])) {
         ob_end_clean();
@@ -188,53 +182,41 @@ try {
     
     $formatInfo = $VIDEO_FORMATS[$extension];
     
-    // Get file size 
-    $originalContentLength = getFileSize($sourceUrl);
-    
-    if ($originalContentLength <= 0) {
-        ob_end_clean();
-        http_response_code(500);
-        echo 'Could not determine file size';
-        exit;
-    }
-    
-    // Adjusted content length (removing 4 bytes ZIP header)
-    $contentLength = $originalContentLength - 4;
+    // Process Range header if present
+    $rangeHeader = isset($_SERVER['HTTP_RANGE']) ? $_SERVER['HTTP_RANGE'] : null;
+    $range = parseRange($rangeHeader);
+    $start = $range ? $range['start'] : 0;
     
     // Clear any existing output before sending headers
     ob_end_clean();
     
-    // Process Range header if present
-    $rangeHeader = isset($_SERVER['HTTP_RANGE']) ? $_SERVER['HTTP_RANGE'] : null;
-    $range = parseRange($rangeHeader, $contentLength);
+    // Send basic headers to start the download immediately
+    // Note: We're not setting Content-Length since we don't know it yet
+    // This will make the download start as a chunked transfer
+    header('Content-Type: ' . $formatInfo['mimeType']);
+    header('Content-Disposition: attachment; filename="' . $title . '"');
+    header('Accept-Ranges: bytes');
+    header('Cache-Control: no-cache, no-store, must-revalidate');
+    header('Pragma: no-cache');
+    header('Expires: 0');
     
     if ($range) {
-        // Handle range request (resume support)
-        $start = $range['start'];
-        $end = $range['end'];
-        $chunkSize = $end - $start + 1;
-        
-        // Set up partial response headers
         http_response_code(206); // Partial Content
-        header('Content-Type: ' . $formatInfo['mimeType']);
-        header('Content-Disposition: attachment; filename="' . $title . '"');
-        header('Content-Length: ' . $chunkSize);
-        header('Content-Range: bytes ' . $start . '-' . $end . '/' . $contentLength);
-        header('Accept-Ranges: bytes');
-        
-        // Stream the file
-        streamFileWithoutZipHeader($sourceUrl, $start, $end);
+        if (isset($range['end'])) {
+            header('Content-Range: bytes ' . $start . '-' . $range['end'] . '/*');
+        } else {
+            header('Content-Range: bytes ' . $start . '-*/*');
+        }
     } else {
-        // Full download
         http_response_code(200);
-        header('Content-Type: ' . $formatInfo['mimeType']);
-        header('Content-Disposition: attachment; filename="' . $title . '"');
-        header('Content-Length: ' . $contentLength);
-        header('Accept-Ranges: bytes');
-        
-        // Stream the full file
-        streamFileWithoutZipHeader($sourceUrl);
     }
+    
+    // Start streaming immediately - this needs to happen within the 10-second limit
+    streamFileQuick($sourceUrl, $start);
+    
+    // Note: The script will terminate before hitting Vercel's timeout,
+    // but the client will have already started receiving data
+    
 } catch (Exception $e) {
     ob_end_clean();
     http_response_code(500);
