@@ -82,35 +82,67 @@ function parseRange($rangeHeader, $fileSize) {
     return ['start' => $start, 'end' => $end];
 }
 
-// Function to stream a file in chunks using curl instead of fopen
-function streamFileWithoutZipHeaderWithCurl($sourceUrl, $start = 0, $end = null, $skipBytes = 4) {
+// Function to get file size using file_get_contents instead of curl
+function getFileSize($url) {
+    $context = stream_context_create([
+        'http' => [
+            'method' => 'HEAD',
+            'follow_location' => 1,
+            'ignore_errors' => true
+        ],
+        'ssl' => [
+            'verify_peer' => false,
+            'verify_peer_name' => false
+        ]
+    ]);
+    
+    $headers = @get_headers($url, 1, $context);
+    if (!$headers || strpos($headers[0], '200') === false) {
+        return -1;
+    }
+    
+    if (isset($headers['Content-Length'])) {
+        return (int)$headers['Content-Length'];
+    } elseif (isset($headers['content-length'])) {
+        return (int)$headers['content-length'];
+    }
+    
+    return -1;
+}
+
+// Function to stream a file in chunks using file_get_contents instead of curl
+function streamFileWithoutZipHeader($sourceUrl, $start = 0, $end = null, $skipBytes = 4) {
     // Calculate the range
-    $range = ($start + $skipBytes) . '-';
-    if ($end !== null) {
-        $range .= ($end + $skipBytes);
+    $rangeStart = $start + $skipBytes;
+    $rangeEnd = ($end !== null) ? ($end + $skipBytes) : '';
+    $range = "bytes=$rangeStart-$rangeEnd";
+    
+    // Set up context options
+    $context = stream_context_create([
+        'http' => [
+            'method' => 'GET',
+            'header' => "Range: $range\r\n",
+            'follow_location' => 1,
+            'ignore_errors' => true
+        ],
+        'ssl' => [
+            'verify_peer' => false,
+            'verify_peer_name' => false
+        ]
+    ]);
+    
+    // Stream the content in chunks to avoid memory issues
+    $handle = @fopen($sourceUrl, 'rb', false, $context);
+    if (!$handle) {
+        throw new Exception("Could not open stream for URL: $sourceUrl");
     }
     
-    // Initialize curl
-    $ch = curl_init();
-    curl_setopt($ch, CURLOPT_URL, $sourceUrl);
-    curl_setopt($ch, CURLOPT_RANGE, $range);
-    curl_setopt($ch, CURLOPT_RETURNTRANSFER, false);
-    curl_setopt($ch, CURLOPT_WRITEFUNCTION, function($ch, $data) {
-        echo $data;
+    while (!feof($handle)) {
+        echo fread($handle, 8192); // Read and output 8KB at a time
         flush();
-        return strlen($data);
-    });
-    curl_setopt($ch, CURLOPT_FOLLOWLOCATION, true);
-    curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
-    
-    // Execute the request
-    curl_exec($ch);
-    $error = curl_error($ch);
-    curl_close($ch);
-    
-    if ($error) {
-        throw new Exception("CURL Error: $error");
     }
+    
+    fclose($handle);
 }
 
 // Default password for encryption
@@ -156,16 +188,8 @@ try {
     
     $formatInfo = $VIDEO_FORMATS[$extension];
     
-    // Get file size with HEAD request using curl
-    $ch = curl_init($sourceUrl);
-    curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
-    curl_setopt($ch, CURLOPT_NOBODY, true);
-    curl_setopt($ch, CURLOPT_FOLLOWLOCATION, true);
-    curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
-    curl_exec($ch);
-    
-    $originalContentLength = curl_getinfo($ch, CURLINFO_CONTENT_LENGTH_DOWNLOAD);
-    curl_close($ch);
+    // Get file size 
+    $originalContentLength = getFileSize($sourceUrl);
     
     if ($originalContentLength <= 0) {
         ob_end_clean();
@@ -175,7 +199,6 @@ try {
     }
     
     // Adjusted content length (removing 4 bytes ZIP header)
-    $originalContentLength = (int)$originalContentLength;
     $contentLength = $originalContentLength - 4;
     
     // Clear any existing output before sending headers
@@ -200,7 +223,7 @@ try {
         header('Accept-Ranges: bytes');
         
         // Stream the file
-        streamFileWithoutZipHeaderWithCurl($sourceUrl, $start, $end);
+        streamFileWithoutZipHeader($sourceUrl, $start, $end);
     } else {
         // Full download
         http_response_code(200);
@@ -210,7 +233,7 @@ try {
         header('Accept-Ranges: bytes');
         
         // Stream the full file
-        streamFileWithoutZipHeaderWithCurl($sourceUrl);
+        streamFileWithoutZipHeader($sourceUrl);
     }
 } catch (Exception $e) {
     ob_end_clean();
